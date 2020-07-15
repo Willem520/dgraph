@@ -19,9 +19,13 @@ package resolve
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io/ioutil"
+	"strconv"
 	"strings"
 	"testing"
+
+	"google.golang.org/grpc/metadata"
 
 	dgoapi "github.com/dgraph-io/dgo/v200/protos/api"
 	"github.com/dgraph-io/dgraph/graphql/authorization"
@@ -47,8 +51,12 @@ type AuthQueryRewritingCase struct {
 	Variables string
 
 	// Dgraph upsert query and mutations built from the GQL
-	DGQuery     string
-	DGMutations []*dgraphMutation
+	DGQuery        string
+	DGQuerySec     string
+	DGMutations    []*dgraphMutation
+	DGMutationsSec []*dgraphMutation
+
+	Length string
 
 	// UIDS and json from the Dgraph result
 	Uids string
@@ -58,21 +66,28 @@ type AuthQueryRewritingCase struct {
 	AuthQuery string
 	AuthJson  string
 
+	// Indicates if we should skip auth query verification when using authExecutor.
+	// Example: Top level RBAC rules is true.
+	SkipAuth bool
+
 	Error *x.GqlError
 }
 
 type authExecutor struct {
-	t     *testing.T
-	state int
+	t      *testing.T
+	state  int
+	length int
 
 	// initial mutation
-	upsertQuery string
+	upsertQuery []string
 	json        string
 	uids        string
 
 	// auth
 	authQuery string
 	authJson  string
+
+	skipAuth bool
 }
 
 func (ex *authExecutor) Execute(ctx context.Context, req *dgoapi.Request) (*dgoapi.Response, error) {
@@ -80,9 +95,10 @@ func (ex *authExecutor) Execute(ctx context.Context, req *dgoapi.Request) (*dgoa
 	switch ex.state {
 	case 1:
 		// initial mutation
+		ex.length -= 1
 
 		// check that the upsert has built in auth, if required
-		require.Equal(ex.t, ex.upsertQuery, req.Query)
+		require.Equal(ex.t, ex.upsertQuery[ex.length], req.Query)
 
 		var assigned map[string]string
 		if ex.uids != "" {
@@ -93,6 +109,15 @@ func (ex *authExecutor) Execute(ctx context.Context, req *dgoapi.Request) (*dgoa
 		if len(assigned) == 0 {
 			// skip state 2, there's no new nodes to apply auth to
 			ex.state++
+		}
+
+		// For rules that don't require auth, it should directly go to step 3.
+		if ex.skipAuth {
+			ex.state++
+		}
+
+		if ex.length != 0 {
+			ex.state = 0
 		}
 
 		return &dgoapi.Response{
@@ -129,6 +154,93 @@ func (ex *authExecutor) CommitOrAbort(ctx context.Context, tc *dgoapi.TxnContext
 	return nil
 }
 
+func TestStringCustomClaim(t *testing.T) {
+	sch, err := ioutil.ReadFile("../e2e/auth/schema.graphql")
+	require.NoError(t, err, "Unable to read schema file")
+
+	authSchema, err := testutil.AppendAuthInfo(sch, authorization.HMAC256, "")
+	require.NoError(t, err)
+
+	test.LoadSchemaFromString(t, string(authSchema))
+
+	// Token with string custom claim
+	// "https://xyz.io/jwt/claims": "{\"USER\": \"50950b40-262f-4b26-88a7-cbbb780b2176\", \"ROLE\": \"ADMIN\"}",
+	token := "eyJraWQiOiIyRWplN2tIRklLZS92MFRVT3JRYlVJWWJxSWNNUHZ2TFBjM3RSQ25EclBBPSIsImFsZyI6IkhTMjU2In0.eyJzdWIiOiI1MDk1MGI0MC0yNjJmLTRiMjYtODhhNy1jYmJiNzgwYjIxNzYiLCJjb2duaXRvOmdyb3VwcyI6WyJBRE1JTiJdLCJlbWFpbF92ZXJpZmllZCI6dHJ1ZSwiaXNzIjoiaHR0cHM6Ly9jb2duaXRvLWlkcC5hcC1zb3V0aGVhc3QtMi5hbWF6b25hd3MuY29tL2FwLXNvdXRoZWFzdC0yX0dmbWVIZEZ6NCIsImNvZ25pdG86dXNlcm5hbWUiOiI1MDk1MGI0MC0yNjJmLTRiMjYtODhhNy1jYmJiNzgwYjIxNzYiLCJodHRwczovL3h5ei5pby9qd3QvY2xhaW1zIjoie1wiVVNFUlwiOiBcIjUwOTUwYjQwLTI2MmYtNGIyNi04OGE3LWNiYmI3ODBiMjE3NlwiLCBcIlJPTEVcIjogXCJBRE1JTlwifSIsImF1ZCI6IjYzZG8wcTE2bjZlYmpna3VtdTA1a2tlaWFuIiwiZXZlbnRfaWQiOiIzMWM5ZDY4NC0xZDQ1LTQ2ZjctOGMyYi1jYzI3YjFmNmYwMWIiLCJ0b2tlbl91c2UiOiJpZCIsImF1dGhfdGltZSI6MTU5MDMzMzM1NiwibmFtZSI6IkRhdmlkIFBlZWsiLCJleHAiOjk1OTAzNzYwMzIsImlhdCI6MTU5MDM3MjQzMiwiZW1haWwiOiJkYXZpZEB0eXBlam9pbi5jb20ifQ.whgQ9QVMOa0jFYBKhCytlm25-dJiIxcfUFligjav0K0"
+	md := metadata.New(map[string]string{"authorizationJwt": token})
+	ctx := metadata.NewIncomingContext(context.Background(), md)
+
+	authVar, err := authorization.ExtractAuthVariables(ctx)
+	require.NoError(t, err)
+
+	result := map[string]interface{}{
+		"ROLE": "ADMIN",
+		"USER": "50950b40-262f-4b26-88a7-cbbb780b2176",
+	}
+	require.Equal(t, authVar, result)
+}
+
+func TestAudienceClaim(t *testing.T) {
+	sch, err := ioutil.ReadFile("../e2e/auth/schema.graphql")
+	require.NoError(t, err, "Unable to read schema file")
+
+	authSchema, err := testutil.AppendAuthInfo(sch, authorization.HMAC256, "")
+	require.NoError(t, err)
+
+	test.LoadSchemaFromString(t, string(authSchema))
+
+	// Verify that authorization information is set correctly.
+	metainfo := authorization.GetAuthMeta()
+	require.Equal(t, metainfo.Algo, authorization.HMAC256)
+	require.Equal(t, metainfo.Header, "X-Test-Auth")
+	require.Equal(t, metainfo.Namespace, "https://xyz.io/jwt/claims")
+	require.Equal(t, metainfo.VerificationKey, "secretkey")
+	require.Equal(t, metainfo.Audience, []string{"aud1", "63do0q16n6ebjgkumu05kkeian", "aud5"})
+
+	testCases := []struct {
+		name  string
+		token string
+		err   error
+	}{
+		{
+			name:  `Token with valid audience: { "aud": "63do0q16n6ebjgkumu05kkeian" }`,
+			token: "eyJraWQiOiIyRWplN2tIRklLZS92MFRVT3JRYlVJWWJxSWNNUHZ2TFBjM3RSQ25EclBBPSIsImFsZyI6IkhTMjU2In0.eyJzdWIiOiI1MDk1MGI0MC0yNjJmLTRiMjYtODhhNy1jYmJiNzgwYjIxNzYiLCJjb2duaXRvOmdyb3VwcyI6WyJBRE1JTiJdLCJlbWFpbF92ZXJpZmllZCI6dHJ1ZSwiaXNzIjoiaHR0cHM6Ly9jb2duaXRvLWlkcC5hcC1zb3V0aGVhc3QtMi5hbWF6b25hd3MuY29tL2FwLXNvdXRoZWFzdC0yX0dmbWVIZEZ6NCIsImNvZ25pdG86dXNlcm5hbWUiOiI1MDk1MGI0MC0yNjJmLTRiMjYtODhhNy1jYmJiNzgwYjIxNzYiLCJodHRwczovL3h5ei5pby9qd3QvY2xhaW1zIjoie1wiVVNFUlwiOiBcIjUwOTUwYjQwLTI2MmYtNGIyNi04OGE3LWNiYmI3ODBiMjE3NlwiLCBcIlJPTEVcIjogXCJBRE1JTlwifSIsImF1ZCI6IjYzZG8wcTE2bjZlYmpna3VtdTA1a2tlaWFuIiwiZXZlbnRfaWQiOiIzMWM5ZDY4NC0xZDQ1LTQ2ZjctOGMyYi1jYzI3YjFmNmYwMWIiLCJ0b2tlbl91c2UiOiJpZCIsImF1dGhfdGltZSI6MTU5MDMzMzM1NiwibmFtZSI6IkRhdmlkIFBlZWsiLCJleHAiOjk1OTAzNzYwMzIsImlhdCI6MTU5MDM3MjQzMiwiZW1haWwiOiJkYXZpZEB0eXBlam9pbi5jb20ifQ.whgQ9QVMOa0jFYBKhCytlm25-dJiIxcfUFligjav0K0",
+		},
+		{
+			name:  `Token with invalid audience: { "aud": "invalidAudience" }`,
+			token: "eyJraWQiOiIyRWplN2tIRklLZS92MFRVT3JRYlVJWWJxSWNNUHZ2TFBjM3RSQ25EclBBPSIsImFsZyI6IkhTMjU2In0.eyJzdWIiOiI1MDk1MGI0MC0yNjJmLTRiMjYtODhhNy1jYmJiNzgwYjIxNzYiLCJjb2duaXRvOmdyb3VwcyI6WyJBRE1JTiJdLCJlbWFpbF92ZXJpZmllZCI6dHJ1ZSwiaXNzIjoiaHR0cHM6Ly9jb2duaXRvLWlkcC5hcC1zb3V0aGVhc3QtMi5hbWF6b25hd3MuY29tL2FwLXNvdXRoZWFzdC0yX0dmbWVIZEZ6NCIsImNvZ25pdG86dXNlcm5hbWUiOiI1MDk1MGI0MC0yNjJmLTRiMjYtODhhNy1jYmJiNzgwYjIxNzYiLCJodHRwczovL3h5ei5pby9qd3QvY2xhaW1zIjoie1wiVVNFUlwiOiBcIjUwOTUwYjQwLTI2MmYtNGIyNi04OGE3LWNiYmI3ODBiMjE3NlwiLCBcIlJPTEVcIjogXCJBRE1JTlwifSIsImF1ZCI6ImludmFsaWRBdWRpZW5jZSIsImV2ZW50X2lkIjoiMzFjOWQ2ODQtMWQ0NS00NmY3LThjMmItY2MyN2IxZjZmMDFiIiwidG9rZW5fdXNlIjoiaWQiLCJhdXRoX3RpbWUiOjE1OTAzMzMzNTYsIm5hbWUiOiJEYXZpZCBQZWVrIiwiZXhwIjo5NTkwMzc2MDMyLCJpYXQiOjE1OTAzNzI0MzIsImVtYWlsIjoiZGF2aWRAdHlwZWpvaW4uY29tIn0.b-K-NtNAswh3_YwYmvEMd0IkghbDQbw2w9kFkCJ3tuM",
+			err:   fmt.Errorf("JWT `aud` value doesn't match with the audience"),
+		},
+		{
+			name:  "Token without audience field",
+			token: "eyJraWQiOiIyRWplN2tIRklLZS92MFRVT3JRYlVJWWJxSWNNUHZ2TFBjM3RSQ25EclBBPSIsImFsZyI6IkhTMjU2In0.eyJzdWIiOiI1MDk1MGI0MC0yNjJmLTRiMjYtODhhNy1jYmJiNzgwYjIxNzYiLCJjb2duaXRvOmdyb3VwcyI6WyJBRE1JTiJdLCJlbWFpbF92ZXJpZmllZCI6dHJ1ZSwiaXNzIjoiaHR0cHM6Ly9jb2duaXRvLWlkcC5hcC1zb3V0aGVhc3QtMi5hbWF6b25hd3MuY29tL2FwLXNvdXRoZWFzdC0yX0dmbWVIZEZ6NCIsImNvZ25pdG86dXNlcm5hbWUiOiI1MDk1MGI0MC0yNjJmLTRiMjYtODhhNy1jYmJiNzgwYjIxNzYiLCJodHRwczovL3h5ei5pby9qd3QvY2xhaW1zIjoie1wiVVNFUlwiOiBcIjUwOTUwYjQwLTI2MmYtNGIyNi04OGE3LWNiYmI3ODBiMjE3NlwiLCBcIlJPTEVcIjogXCJBRE1JTlwifSIsImV2ZW50X2lkIjoiMzFjOWQ2ODQtMWQ0NS00NmY3LThjMmItY2MyN2IxZjZmMDFiIiwidG9rZW5fdXNlIjoiaWQiLCJhdXRoX3RpbWUiOjE1OTAzMzMzNTYsIm5hbWUiOiJEYXZpZCBQZWVrIiwiZXhwIjo5NTkwMzc2MDMyLCJpYXQiOjE1OTAzNzI0MzIsImVtYWlsIjoiZGF2aWRAdHlwZWpvaW4uY29tIn0.rWLwxa_IyQcQITVu7dVDYNygipfpQt9t2IimrmQ_BJo",
+		},
+		{
+			name:  `Token with multiple audience: {"aud": ["aud1", "aud2", "aud3"]}`,
+			token: "eyJraWQiOiIyRWplN2tIRklLZS92MFRVT3JRYlVJWWJxSWNNUHZ2TFBjM3RSQ25EclBBPSIsImFsZyI6IkhTMjU2In0.eyJzdWIiOiI1MDk1MGI0MC0yNjJmLTRiMjYtODhhNy1jYmJiNzgwYjIxNzYiLCJjb2duaXRvOmdyb3VwcyI6WyJBRE1JTiJdLCJlbWFpbF92ZXJpZmllZCI6dHJ1ZSwiaXNzIjoiaHR0cHM6Ly9jb2duaXRvLWlkcC5hcC1zb3V0aGVhc3QtMi5hbWF6b25hd3MuY29tL2FwLXNvdXRoZWFzdC0yX0dmbWVIZEZ6NCIsImNvZ25pdG86dXNlcm5hbWUiOiI1MDk1MGI0MC0yNjJmLTRiMjYtODhhNy1jYmJiNzgwYjIxNzYiLCJodHRwczovL3h5ei5pby9qd3QvY2xhaW1zIjoie1wiVVNFUlwiOiBcIjUwOTUwYjQwLTI2MmYtNGIyNi04OGE3LWNiYmI3ODBiMjE3NlwiLCBcIlJPTEVcIjogXCJBRE1JTlwifSIsImF1ZCI6WyJhdWQxIiwiYXVkMiIsImF1ZDMiXSwiZXZlbnRfaWQiOiIzMWM5ZDY4NC0xZDQ1LTQ2ZjctOGMyYi1jYzI3YjFmNmYwMWIiLCJ0b2tlbl91c2UiOiJpZCIsImF1dGhfdGltZSI6MTU5MDMzMzM1NiwibmFtZSI6IkRhdmlkIFBlZWsiLCJleHAiOjk1OTAzNzYwMzIsImlhdCI6MTU5MDM3MjQzMiwiZW1haWwiOiJkYXZpZEB0eXBlam9pbi5jb20ifQ.gDI-4e9v15643CjxoSCjE_UJ-ext8eiP-OUMsaZmOdw",
+		},
+	}
+
+	for _, tcase := range testCases {
+		t.Run(tcase.name, func(t *testing.T) {
+			md := metadata.New(map[string]string{"authorizationJwt": tcase.token})
+			ctx := metadata.NewIncomingContext(context.Background(), md)
+
+			authVar, err := authorization.ExtractAuthVariables(ctx)
+			require.Equal(t, tcase.err, err)
+
+			if err != nil {
+				return
+			}
+
+			result := map[string]interface{}{
+				"ROLE": "ADMIN",
+				"USER": "50950b40-262f-4b26-88a7-cbbb780b2176",
+			}
+			require.Equal(t, authVar, result)
+		})
+	}
+}
+
 // Tests showing that the query rewriter produces the expected Dgraph queries
 // when it also needs to write in auth.
 func queryRewriting(t *testing.T, sch string, authMeta *testutil.AuthMeta) {
@@ -144,7 +256,6 @@ func queryRewriting(t *testing.T, sch string, authMeta *testutil.AuthMeta) {
 
 	for _, tcase := range tests {
 		t.Run(tcase.Name, func(t *testing.T) {
-
 			op, err := gqlSchema.Operation(
 				&schema.Request{
 					Query: tcase.GQLQuery,
@@ -200,16 +311,17 @@ func mutationQueryRewriting(t *testing.T, sch string, authMeta *testutil.AuthMet
 			rewriter: NewAddRewriter,
 			assigned: map[string]string{"Ticket1": "0x4"},
 			dgQuery: `query {
-  ticket(func: uid(Ticket2)) @filter(uid(Ticket3)) {
+  ticket(func: uid(TicketRoot)) {
     id : uid
     title : Ticket.title
-    onColumn : Ticket.onColumn @filter(uid(Column1)) {
+    onColumn : Ticket.onColumn @filter(uid(Column3)) {
       colID : uid
       name : Column.name
     }
   }
-  Ticket2 as var(func: uid(0x4))
-  Ticket3 as var(func: uid(Ticket2)) @cascade {
+  TicketRoot as var(func: uid(Ticket4)) @filter(uid(TicketAuth5))
+  Ticket4 as var(func: uid(0x4))
+  TicketAuth5 as var(func: uid(Ticket4)) @cascade {
     onColumn : Ticket.onColumn {
       inProject : Column.inProject {
         roles : Project.roles @filter(eq(Role.permission, "VIEW")) {
@@ -222,7 +334,11 @@ func mutationQueryRewriting(t *testing.T, sch string, authMeta *testutil.AuthMet
     }
     dgraph.uid : uid
   }
-  Column1 as var(func: type(Column)) @cascade {
+  var(func: uid(TicketRoot)) {
+    Column1 as Ticket.onColumn
+  }
+  Column3 as var(func: uid(Column1)) @filter(uid(ColumnAuth2))
+  ColumnAuth2 as var(func: uid(Column1)) @cascade {
     inProject : Column.inProject {
       roles : Project.roles @filter(eq(Role.permission, "VIEW")) {
         assignedTo : Role.assignedTo @filter(eq(User.username, "user1"))
@@ -251,16 +367,17 @@ func mutationQueryRewriting(t *testing.T, sch string, authMeta *testutil.AuthMet
 			result: map[string]interface{}{
 				"updateTicket": []interface{}{map[string]interface{}{"uid": "0x4"}}},
 			dgQuery: `query {
-  ticket(func: uid(Ticket2)) @filter(uid(Ticket3)) {
+  ticket(func: uid(TicketRoot)) {
     id : uid
     title : Ticket.title
-    onColumn : Ticket.onColumn @filter(uid(Column1)) {
+    onColumn : Ticket.onColumn @filter(uid(Column3)) {
       colID : uid
       name : Column.name
     }
   }
-  Ticket2 as var(func: uid(0x4))
-  Ticket3 as var(func: uid(Ticket2)) @cascade {
+  TicketRoot as var(func: uid(Ticket4)) @filter(uid(TicketAuth5))
+  Ticket4 as var(func: uid(0x4))
+  TicketAuth5 as var(func: uid(Ticket4)) @cascade {
     onColumn : Ticket.onColumn {
       inProject : Column.inProject {
         roles : Project.roles @filter(eq(Role.permission, "VIEW")) {
@@ -273,7 +390,11 @@ func mutationQueryRewriting(t *testing.T, sch string, authMeta *testutil.AuthMet
     }
     dgraph.uid : uid
   }
-  Column1 as var(func: type(Column)) @cascade {
+  var(func: uid(TicketRoot)) {
+    Column1 as Ticket.onColumn
+  }
+  Column3 as var(func: uid(Column1)) @filter(uid(ColumnAuth2))
+  ColumnAuth2 as var(func: uid(Column1)) @cascade {
     inProject : Column.inProject {
       roles : Project.roles @filter(eq(Role.permission, "VIEW")) {
         assignedTo : Role.assignedTo @filter(eq(User.username, "user1"))
@@ -330,6 +451,19 @@ func deleteQueryRewriting(t *testing.T, sch string, authMeta *testutil.AuthMeta)
 	err = yaml.Unmarshal(b, &tests)
 	require.NoError(t, err, "Unable to unmarshal tests to yaml.")
 
+	compareMutations := func(t *testing.T, test []*dgraphMutation, generated []*dgoapi.Mutation) {
+		require.Len(t, generated, len(test))
+		for i, expected := range test {
+			require.Equal(t, expected.Cond, generated[i].Cond)
+			if len(generated[i].SetJson) > 0 || expected.SetJSON != "" {
+				require.JSONEq(t, expected.SetJSON, string(generated[i].SetJson))
+			}
+			if len(generated[i].DeleteJson) > 0 || expected.DeleteJSON != "" {
+				require.JSONEq(t, expected.DeleteJSON, string(generated[i].DeleteJson))
+			}
+		}
+	}
+
 	gqlSchema := test.LoadSchemaFromString(t, sch)
 
 	for _, tcase := range tests {
@@ -362,24 +496,21 @@ func deleteQueryRewriting(t *testing.T, sch string, authMeta *testutil.AuthMeta)
 
 			// -- Act --
 			upsert, err := rewriterToTest.Rewrite(ctx, mut)
-			q := upsert.Query
-			muts := upsert.Mutations
 
 			// -- Assert --
 			if tcase.Error != nil || err != nil {
+				require.NotNil(t, err)
+				require.NotNil(t, tcase.Error)
 				require.Equal(t, tcase.Error.Error(), err.Error())
-			} else {
-				require.Equal(t, tcase.DGQuery, dgraph.AsString(q))
-				require.Len(t, muts, len(tcase.DGMutations))
-				for i, expected := range tcase.DGMutations {
-					require.Equal(t, expected.Cond, muts[i].Cond)
-					if len(muts[i].SetJson) > 0 || expected.SetJSON != "" {
-						require.JSONEq(t, expected.SetJSON, string(muts[i].SetJson))
-					}
-					if len(muts[i].DeleteJson) > 0 || expected.DeleteJSON != "" {
-						require.JSONEq(t, expected.DeleteJSON, string(muts[i].DeleteJson))
-					}
-				}
+				return
+			}
+
+			require.Equal(t, tcase.DGQuery, dgraph.AsString(upsert[0].Query))
+			compareMutations(t, tcase.DGMutations, upsert[0].Mutations)
+
+			if len(upsert) > 1 {
+				require.Equal(t, tcase.DGQuerySec, dgraph.AsString(upsert[1].Query))
+				compareMutations(t, tcase.DGMutationsSec, upsert[1].Mutations)
 			}
 		})
 	}
@@ -472,13 +603,26 @@ func checkAddUpdateCase(
 	ctx, err := authMeta.AddClaimsToContext(context.Background())
 	require.NoError(t, err)
 
+	length := 1
+	upsertQuery := []string{tcase.DGQuery}
+
+	if tcase.Length != "" {
+		length, _ = strconv.Atoi(tcase.Length)
+	}
+
+	if length == 2 {
+		upsertQuery = []string{tcase.DGQuerySec, tcase.DGQuery}
+	}
+
 	ex := &authExecutor{
 		t:           t,
-		upsertQuery: tcase.DGQuery,
+		upsertQuery: upsertQuery,
 		json:        tcase.Json,
 		uids:        tcase.Uids,
 		authQuery:   tcase.AuthQuery,
 		authJson:    tcase.AuthJson,
+		skipAuth:    tcase.SkipAuth,
+		length:      length,
 	}
 	resolver := NewDgraphResolver(rewriter(), ex, StdMutationCompletion(mut.ResponseName()))
 
@@ -492,7 +636,7 @@ func checkAddUpdateCase(
 	}
 }
 
-func TestAuthSchemaRewriting(t *testing.T) {
+func TestAuthQueryRewriting(t *testing.T) {
 	sch, err := ioutil.ReadFile("../e2e/auth/schema.graphql")
 	require.NoError(t, err, "Unable to read schema file")
 
@@ -505,7 +649,7 @@ func TestAuthSchemaRewriting(t *testing.T) {
 
 		authMeta, err := authorization.Parse(strSchema)
 		metaInfo := &testutil.AuthMeta{
-			PublicKey: authMeta.PublicKey,
+			PublicKey: authMeta.VerificationKey,
 			Namespace: authMeta.Namespace,
 			Algo:      authMeta.Algo,
 		}

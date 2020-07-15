@@ -221,6 +221,9 @@ func RunAll(t *testing.T) {
 	// schema tests
 	t.Run("graphql descriptions", graphQLDescriptions)
 
+	// header tests
+	t.Run("touched uids header", touchedUidsHeader)
+
 	// encoding
 	t.Run("gzip compression", gzipCompression)
 	t.Run("gzip compression header", gzipCompressionHeader)
@@ -260,6 +263,9 @@ func RunAll(t *testing.T) {
 	t.Run("query typename", queryTypename)
 	t.Run("query nested typename", queryNestedTypename)
 	t.Run("typename for interface", typenameForInterface)
+	t.Run("query only typename", queryOnlyTypename)
+	t.Run("query nested only typename", querynestedOnlyTypename)
+	t.Run("test onlytypename for interface types", onlytypenameForInterface)
 
 	t.Run("get state by xid", getStateByXid)
 	t.Run("get state without args", getStateWithoutArgs)
@@ -306,6 +312,7 @@ func RunAll(t *testing.T) {
 	t.Run("ensure alias in mutation payload", ensureAliasInMutationPayload)
 	t.Run("mutations have extensions", mutationsHaveExtensions)
 	t.Run("alias works for mutations", mutationsWithAlias)
+	t.Run("three level deep", threeLevelDeepMutation)
 
 	// error tests
 	t.Run("graphql completion on", graphQLCompletionOn)
@@ -740,11 +747,16 @@ func addSchema(url, schema string) error {
 				}
 			}
 		}
+		Errors []interface{}
 	}
 
 	err = json.Unmarshal(resp, &addResult)
 	if err != nil {
 		return errors.Wrap(err, "error trying to unmarshal GraphQL mutation result")
+	}
+
+	if len(addResult.Errors) > 0 {
+		return errors.Errorf("%v", addResult.Errors)
 	}
 
 	if addResult.Data.UpdateGQLSchema.GQLSchema.Schema == "" {

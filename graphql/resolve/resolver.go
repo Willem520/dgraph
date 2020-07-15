@@ -45,11 +45,35 @@ import (
 	"github.com/dgraph-io/dgraph/graphql/schema"
 )
 
+type resolveCtxKey string
+
 const (
 	methodResolve = "RequestResolver.Resolve"
 
+	resolveStartTime resolveCtxKey = "resolveStartTime"
+
 	resolverFailed    = false
 	resolverSucceeded = true
+
+	errExpectedScalar = "A scalar type was returned, but GraphQL was expecting an object. " +
+		"This indicates an internal error - " +
+		"probably a mismatch between the GraphQL and Dgraph/remote schemas. " +
+		"The value was resolved as null (which may trigger GraphQL error propagation) " +
+		"and as much other data as possible returned."
+
+	errExpectedObject = "A list was returned, but GraphQL was expecting just one item. " +
+		"This indicates an internal error - " +
+		"probably a mismatch between the GraphQL and Dgraph/remote schemas. " +
+		"The value was resolved as null (which may trigger GraphQL error propagation) " +
+		"and as much other data as possible returned."
+
+	errExpectedList = "An object was returned, but GraphQL was expecting a list of objects. " +
+		"This indicates an internal error - " +
+		"probably a mismatch between the GraphQL and Dgraph/remote schemas. " +
+		"The value was resolved as null (which may trigger GraphQL error propagation) " +
+		"and as much other data as possible returned."
+
+	errInternal = "Internal error"
 )
 
 // A ResolverFactory finds the right resolver for a query/mutation.
@@ -213,6 +237,10 @@ func (rf *resolverFactory) WithSchemaIntrospection() ResolverFactory {
 		WithQueryResolver("__type",
 			func(q schema.Query) QueryResolver {
 				return QueryResolverFunc(resolveIntrospection)
+			}).
+		WithQueryResolver("__typename",
+			func(q schema.Query) QueryResolver {
+				return QueryResolverFunc(resolveIntrospection)
 			})
 }
 
@@ -353,20 +381,34 @@ func (r *RequestResolver) Resolve(ctx context.Context, gqlReq *schema.Request) *
 
 	if r == nil {
 		glog.Errorf("Call to Resolve with nil RequestResolver")
-		return schema.ErrorResponse(errors.New("Internal error"))
+		return schema.ErrorResponse(errors.New(errInternal))
 	}
 
 	if r.schema == nil {
 		glog.Errorf("Call to Resolve with no schema")
-		return schema.ErrorResponse(errors.New("Internal error"))
+		return schema.ErrorResponse(errors.New(errInternal))
 	}
+
+	startTime := time.Now()
+	resp := &schema.Response{
+		Extensions: &schema.Extensions{
+			Tracing: &schema.Trace{
+				Version:   1,
+				StartTime: startTime.Format(time.RFC3339Nano),
+			},
+		},
+	}
+	defer func() {
+		endTime := time.Now()
+		resp.Extensions.Tracing.EndTime = endTime.Format(time.RFC3339Nano)
+		resp.Extensions.Tracing.Duration = endTime.Sub(startTime).Nanoseconds()
+	}()
+	ctx = context.WithValue(ctx, resolveStartTime, startTime)
 
 	op, err := r.schema.Operation(gqlReq)
 	if err != nil {
 		return schema.ErrorResponse(err)
 	}
-
-	resp := &schema.Response{}
 
 	if glog.V(3) {
 		// don't log the introspection queries they are sent too frequently
@@ -400,7 +442,8 @@ func (r *RequestResolver) Resolve(ctx context.Context, gqlReq *schema.Request) *
 						allResolved[storeAt] = &Resolved{
 							Data:  nil,
 							Field: q,
-							Err:   err}
+							Err:   err,
+						}
 					})
 
 				allResolved[storeAt] = r.resolvers.queryResolverFor(q).Resolve(ctx, q)
@@ -414,6 +457,7 @@ func (r *RequestResolver) Resolve(ctx context.Context, gqlReq *schema.Request) *
 			// Errors and data in the same response is valid.  Both WithError and
 			// AddData handle nil cases.
 			addResult(resp, res)
+
 		}
 	}
 	// A single request can contain either queries or mutations - not both.
@@ -462,7 +506,11 @@ func (r *RequestResolver) Resolve(ctx context.Context, gqlReq *schema.Request) *
 
 // ValidateSubscription will check the given subscription query is valid or not.
 func (r *RequestResolver) ValidateSubscription(req *schema.Request) error {
-	return errors.New("Subscriptions are not supported")
+	if r.schema == nil {
+		glog.Errorf("Call to ValidateSubscription with no schema")
+		return errors.New(errInternal)
+	}
+
 	op, err := r.schema.Operation(req)
 	if err != nil {
 		return err
@@ -1258,6 +1306,21 @@ func completeObject(
 			}
 		}
 
+		// Check that we should check that data should be of list type when we expect
+		// f.Type().ListType() to be non-nil.
+		if val != nil && f.Type().ListType() != nil {
+			switch val.(type) {
+			case []interface{}, []map[string]interface{}:
+			default:
+				// We were expecting a list but got a value which wasn't a list. Lets return an
+				// error.
+				return nil, x.GqlErrorList{&x.GqlError{
+					Message:   errExpectedList,
+					Locations: []x.Location{f.Location()},
+					Path:      copyPath(path),
+				}}
+			}
+		}
 		completed, err := completeValue(append(path, f.ResponseName()), f, val)
 		errs = append(errs, err...)
 		if completed == nil {
@@ -1283,6 +1346,23 @@ func completeValue(
 
 	switch val := val.(type) {
 	case map[string]interface{}:
+		switch field.Type().Name() {
+		case "String", "ID", "Boolean", "Float", "Int", "DateTime":
+			return nil, x.GqlErrorList{&x.GqlError{
+				Message:   errExpectedScalar,
+				Locations: []x.Location{field.Location()},
+				Path:      copyPath(path),
+			}}
+		}
+		enumValues := field.EnumValues()
+		if len(enumValues) > 0 {
+			return nil, x.GqlErrorList{&x.GqlError{
+				Message:   errExpectedScalar,
+				Locations: []x.Location{field.Location()},
+				Path:      copyPath(path),
+			}}
+		}
+
 		return completeObject(path, field.SelectionSet(), val)
 	case []interface{}:
 		return completeList(path, field, val)
@@ -1591,11 +1671,7 @@ func mismatched(
 		field.Name(), field.Location().Line, field.Location().Column, field.Type().Name())
 
 	gqlErr := &x.GqlError{
-		Message: "Dgraph returned a list, but GraphQL was expecting just one item.  " +
-			"This indicates an internal error - " +
-			"probably a mismatch between GraphQL and Dgraph schemas.  " +
-			"The value was resolved as null (which may trigger GraphQL error propagation) " +
-			"and as much other data as possible returned.",
+		Message:   errExpectedObject,
 		Locations: []x.Location{field.Location()},
 		Path:      copyPath(path),
 	}
@@ -1773,4 +1849,10 @@ func EmptyResult(f schema.Field, err error) *Resolved {
 		Field: f,
 		Err:   schema.GQLWrapLocationf(err, f.Location(), "resolving %s failed", f.Name()),
 	}
+}
+
+func newtimer(ctx context.Context, Duration *schema.OffsetDuration) schema.OffsetTimer {
+	resolveStartTime, _ := ctx.Value(resolveStartTime).(time.Time)
+	tf := schema.NewOffsetTimerFactory(resolveStartTime)
+	return tf.NewOffsetTimer(Duration)
 }

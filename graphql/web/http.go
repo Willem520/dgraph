@@ -20,6 +20,7 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/json"
+	"strconv"
 
 	"io"
 	"io/ioutil"
@@ -39,7 +40,9 @@ import (
 	"go.opencensus.io/trace"
 )
 
-// An IServeGraphQL can serve a GraphQL endpoint (currently only ons http)
+const touchedUidsHeader = "Graphql-TouchedUids"
+
+// An IServeGraphQL can serve a GraphQL endpoint (currently only on http)
 type IServeGraphQL interface {
 
 	// After ServeGQL is called, this IServeGraphQL serves the new resolvers.
@@ -85,6 +88,9 @@ func (gh *graphqlHandler) Resolve(ctx context.Context, gqlReq *schema.Request) *
 // and sends the schema response using that.
 func write(w http.ResponseWriter, rr *schema.Response, acceptGzip bool) {
 	var out io.Writer = w
+
+	// set TouchedUids header
+	w.Header().Set(touchedUidsHeader, strconv.FormatUint(rr.GetExtensions().GetTouchedUids(), 10))
 
 	// If the receiver accepts gzip, then we would update the writer
 	// and send gzipped content instead.

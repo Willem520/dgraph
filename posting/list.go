@@ -730,6 +730,26 @@ func (l *List) IsEmpty(readTs, afterUid uint64) (bool, error) {
 	return count == 0, nil
 }
 
+func (l *List) getPostingAndLength(readTs, afterUid, uid uint64) (int, bool, *pb.Posting) {
+	l.AssertRLock()
+	var count int
+	var found bool
+	var post *pb.Posting
+	err := l.iterate(readTs, afterUid, func(p *pb.Posting) error {
+		if p.Uid == uid {
+			post = p
+			found = true
+		}
+		count++
+		return nil
+	})
+	if err != nil {
+		return -1, false, nil
+	}
+
+	return count, found, post
+}
+
 func (l *List) length(readTs, afterUid uint64) int {
 	l.AssertRLock()
 	count := 0
@@ -810,26 +830,29 @@ func (l *List) Rollup() ([]*bpb.KV, error) {
 
 // SingleListRollup works like rollup but generates a single list with no splits.
 // It's used during backup so that each backed up posting list is stored in a single key.
-func (l *List) SingleListRollup() (*bpb.KV, error) {
+func (l *List) SingleListRollup(kv *bpb.KV) error {
+	if kv == nil {
+		return errors.Errorf("passed kv pointer cannot be nil")
+	}
+
 	l.RLock()
 	defer l.RUnlock()
 
 	out, err := l.rollup(math.MaxUint64, false)
 	if err != nil {
-		return nil, errors.Wrapf(err, "failed when calling List.rollup")
+		return errors.Wrapf(err, "failed when calling List.rollup")
 	}
 	// out is only nil when the list's minTs is greater than readTs but readTs
 	// is math.MaxUint64 so that's not possible. Assert that's true.
 	x.AssertTrue(out != nil)
 
-	kv := &bpb.KV{}
 	kv.Version = out.newMinTs
 	kv.Key = l.key
 	val, meta := marshalPostingList(out.plist)
 	kv.UserMeta = []byte{meta}
 	kv.Value = val
 
-	return kv, nil
+	return nil
 }
 
 func (out *rollupOutput) marshalPostingListPart(

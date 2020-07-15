@@ -27,14 +27,23 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func getEncConfig() *viper.Viper {
+	config := viper.New()
+	flags := &pflag.FlagSet{}
+	RegisterFlags(flags)
+	config.BindPFlags(flags)
+	return config
+}
+
 func resetConfig(config *viper.Viper) {
 	config.Set(encKeyFile, "")
 
 	config.Set(vaultAddr, "http://localhost:8200")
 	config.Set(vaultRoleIDFile, "")
 	config.Set(vaultSecretIDFile, "")
-	config.Set(vaultPath, "dgraph")
+	config.Set(vaultPath, "secret/data/dgraph")
 	config.Set(vaultField, "enc_key")
+	config.Set(vaultFormat, "base64")
 }
 
 // TODO: The function below allows instantiating a real Vault server. But results in go.mod issues.
@@ -64,44 +73,36 @@ func resetConfig(config *viper.Viper) {
 // }
 
 func TestNewKeyReader(t *testing.T) {
-	config := viper.New()
-	flags := &pflag.FlagSet{}
-	RegisterFlags(flags)
-	config.BindPFlags(flags)
-
+	config := getEncConfig()
 	// Vault and Local combination tests
 	// Both Local and Vault options is invalid.
 	resetConfig(config)
 	config.Set(encKeyFile, "blah")
 	config.Set(vaultRoleIDFile, "aaa")
 	config.Set(vaultSecretIDFile, "bbb")
-	kR, err := NewKeyReader(config)
+	kr, err := newKeyReader(config)
 	require.Error(t, err)
-	require.Nil(t, kR)
+	require.Nil(t, kr)
 
 	// RoleID only is invalid.
 	resetConfig(config)
 	config.Set(vaultRoleIDFile, "aaa")
-	kR, err = NewKeyReader(config)
+	kr, err = newKeyReader(config)
 	require.Error(t, err)
-	require.Nil(t, kR)
+	require.Nil(t, kr)
 
 	// SecretID only is invalid.
 	resetConfig(config)
 	config.Set(vaultSecretIDFile, "bbb")
-	kR, err = NewKeyReader(config)
+	kr, err = newKeyReader(config)
 	require.Error(t, err)
-	require.Nil(t, kR)
+	require.Nil(t, kr)
 
 	// RoleID and SecretID given but RoleID file doesn't exist.
 	resetConfig(config)
 	config.Set(vaultRoleIDFile, "aaa")
 	config.Set(vaultSecretIDFile, "bbb")
-	kR, err = NewKeyReader(config)
-	require.NoError(t, err)
-	require.NotNil(t, kR)
-	require.IsType(t, &vaultKeyReader{}, kR)
-	k, err := kR.ReadKey()
+	k, err := ReadKey(config)
 	require.Nil(t, k)
 	require.Error(t, err)
 
@@ -109,13 +110,22 @@ func TestNewKeyReader(t *testing.T) {
 	resetConfig(config)
 	config.Set(vaultRoleIDFile, "./test-fixtures/dummy_role_id_file")
 	config.Set(vaultSecretIDFile, "bbb")
-	kR, err = NewKeyReader(config)
+	kr, err = newKeyReader(config)
 	require.NoError(t, err)
-	require.NotNil(t, kR)
-	require.IsType(t, &vaultKeyReader{}, kR)
-	k, err = kR.ReadKey()
+	require.NotNil(t, kr)
+	require.IsType(t, &vaultKeyReader{}, kr)
+	k, err = kr.readKey()
 	require.Nil(t, k)
 	require.Error(t, err)
+
+	// Bad vault_format. Must be raw or base64.
+	resetConfig(config)
+	config.Set(vaultRoleIDFile, "./test-fixtures/dummy_role_id_file")
+	config.Set(vaultSecretIDFile, "./test-fixtures/dummy_secret_id_file")
+	config.Set(vaultFormat, "foo") // error.
+	kr, err = newKeyReader(config)
+	require.Error(t, err)
+	require.Nil(t, kr)
 
 	// RoleID and SecretID given but RoleID file and SecretID file exists and is valid.
 	resetConfig(config)
@@ -123,11 +133,11 @@ func TestNewKeyReader(t *testing.T) {
 
 	config.Set(vaultRoleIDFile, "./test-fixtures/dummy_role_id_file")
 	config.Set(vaultSecretIDFile, "./test-fixtures/dummy_secret_id_file")
-	kR, err = NewKeyReader(config)
+	kr, err = newKeyReader(config)
 	require.NoError(t, err)
-	require.NotNil(t, kR)
-	require.IsType(t, &vaultKeyReader{}, kR)
-	k, err = kR.ReadKey()
+	require.NotNil(t, kr)
+	require.IsType(t, &vaultKeyReader{}, kr)
+	k, err = kr.readKey()
 	require.Nil(t, k) // still fails because we need to mock Vault server.
 	require.Error(t, err)
 	//nl.Close()
@@ -135,40 +145,40 @@ func TestNewKeyReader(t *testing.T) {
 	// Bad Encryption Key File
 	resetConfig(config)
 	config.Set(encKeyFile, "blah")
-	kR, err = NewKeyReader(config)
+	kr, err = newKeyReader(config)
 	require.NoError(t, err)
-	require.NotNil(t, kR)
-	require.IsType(t, &localKeyReader{}, kR)
-	k, err = kR.ReadKey()
+	require.NotNil(t, kr)
+	require.IsType(t, &localKeyReader{}, kr)
+	k, err = kr.readKey()
 	require.Nil(t, k)
 	require.Error(t, err)
 
 	// Nil Encryption Key File
 	resetConfig(config)
 	config.Set(encKeyFile, "")
-	kR, err = NewKeyReader(config)
+	kr, err = newKeyReader(config)
 	require.NoError(t, err)
-	require.Nil(t, kR)
+	require.Nil(t, kr)
 
 	// Bad Length Encryption Key File.
 	resetConfig(config)
 	config.Set(encKeyFile, "./test-fixtures/bad-length-enc-key")
-	kR, err = NewKeyReader(config)
+	kr, err = newKeyReader(config)
 	require.NoError(t, err)
-	require.NotNil(t, kR)
-	require.IsType(t, &localKeyReader{}, kR)
-	k, err = kR.ReadKey()
+	require.NotNil(t, kr)
+	require.IsType(t, &localKeyReader{}, kr)
+	k, err = kr.readKey()
 	require.Nil(t, k)
 	require.Error(t, err)
 
 	// Good Encryption Key File.
 	resetConfig(config)
 	config.Set(encKeyFile, "./test-fixtures/enc-key")
-	kR, err = NewKeyReader(config)
+	kr, err = newKeyReader(config)
 	require.NoError(t, err)
-	require.NotNil(t, kR)
-	require.IsType(t, &localKeyReader{}, kR)
-	k, err = kR.ReadKey()
+	require.NotNil(t, kr)
+	require.IsType(t, &localKeyReader{}, kr)
+	k, err = kr.readKey()
 	require.NotNil(t, k)
 	require.NoError(t, err)
 }
@@ -185,7 +195,16 @@ func TestGetReaderWriter(t *testing.T) {
 	require.Equal(t, f, neww)
 
 	// valid key
-	neww, err = GetWriter(ReadEncryptionKeyFile("./test-fixtures/enc-key"), f)
+	config := getEncConfig()
+	config.Set(encKeyFile, "./test-fixtures/enc-key")
+	kr, err := newKeyReader(config)
+	require.NoError(t, err)
+	require.NotNil(t, kr)
+	require.IsType(t, &localKeyReader{}, kr)
+	k, err := kr.readKey()
+	require.NotNil(t, k)
+	require.NoError(t, err)
+	neww, err = GetWriter(k, f)
 	require.NoError(t, err)
 	require.NotEqual(t, f, neww)
 	require.IsType(t, cipher.StreamWriter{}, neww)
@@ -206,7 +225,7 @@ func TestGetReaderWriter(t *testing.T) {
 	require.Equal(t, f, newr)
 
 	// valid key
-	newr, err = GetReader(ReadEncryptionKeyFile("./test-fixtures/enc-key"), f)
+	newr, err = GetReader(k, f)
 	require.NoError(t, err)
 	require.NotEqual(t, f, newr)
 	require.IsType(t, cipher.StreamReader{}, newr)

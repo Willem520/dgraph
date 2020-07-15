@@ -68,7 +68,7 @@ type Region @auth(
     """}
 ){
   id: ID!
-  name: String
+  name: String @search(by: [hash])
   global: Boolean @search
   users: [User]
 }
@@ -192,7 +192,7 @@ type Movie @auth(
     ]}
 ) {
   id: ID!
-  content: String
+  content: String @search(by: [hash])
   hidden: Boolean @search
   regionsAvailable: [Region]
   reviews: [Review]
@@ -263,6 +263,12 @@ type ComplexLog @auth(
       { rule: "{$ROLE: { eq: \"ADMIN\" }}" },
       { not : { rule: "{$ROLE: { eq: \"USER\" }}" }}
      ]},
+      add: {
+        not: { rule: "{$ROLE: { eq: \"USER\" }}" }
+      },
+      update: {
+        not: { rule: "{$ROLE: { eq: \"USER\" }}" }
+      },
       delete: {
       or : [
         { rule: "{$ROLE: { eq: \"ADMIN\" }}"},
@@ -319,13 +325,15 @@ type Project @auth(
      ]}
 ) {
   projID: ID!
-  name: String!
+  name: String! @search(by: [hash])
   roles: [Role]
   columns: [Column] @hasInverse(field: inProject)
   random: String
 }
 
-type Role {
+type Role @auth(
+  delete:  { not : { rule: "{ $ROLE: { eq: \"USER\" }}"} }
+){
   id: ID!
   permission: Permission @search
   assignedTo: [User]
@@ -503,3 +511,14 @@ type Review @auth() {
     comment: String!
 }
 
+type Student @dgraph(type: "is7sowSm")
+@auth(query:  { and : [ {rule: """
+query($USER: String!) {
+    queryStudent(filter: {email: { eq: $USER}}) {
+        __typename
+    }
+}
+"""},{ rule: "{$ROLE: { eq: \"ADMIN\" }}"}]}) {
+    id: ID!
+    email: String! @dgraph(pred: "IOw80vnV") @search(by: [hash])
+}
